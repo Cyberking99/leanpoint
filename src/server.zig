@@ -34,6 +34,21 @@ pub fn serve(
     }
 }
 
+fn methodName(method: std.http.Method) []const u8 {
+    return switch (method) {
+        .GET => "GET",
+        .HEAD => "HEAD",
+        .POST => "POST",
+        .PUT => "PUT",
+        .DELETE => "DELETE",
+        .CONNECT => "CONNECT",
+        .OPTIONS => "OPTIONS",
+        .TRACE => "TRACE",
+        .PATCH => "PATCH",
+        else => "OTHER",
+    };
+}
+
 fn handleRequest(
     allocator: std.mem.Allocator,
     config: *const config_mod.Config,
@@ -43,7 +58,7 @@ fn handleRequest(
     const method = req.head.method;
     const target = req.head.target;
 
-    log.debug("{s} {s}", .{ @tagName(method), target });
+    log.debug("{s} {s}", .{ methodName(method), target });
 
     if (method != .GET and method != .HEAD) {
         try respondText(req, .method_not_allowed, "Method not allowed\n", "text/plain");
