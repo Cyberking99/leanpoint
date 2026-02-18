@@ -7,7 +7,9 @@ pub const Slots = struct {
 };
 
 /// Fetch finalized and justified slots from lean node endpoints
-/// The finalized endpoint returns SSZ-encoded LeanState data
+/// - Finalized: /lean/v0/states/finalized (SSZ-encoded LeanState)
+/// - Justified: /lean/v0/checkpoints/justified (JSON checkpoint with slot)
+/// Falls back to finalized slot for justified when the justified endpoint is unavailable
 pub fn fetchSlots(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -24,14 +26,86 @@ pub fn fetchSlots(
         out_state_ssz,
     );
 
-    // For now, use finalized slot as justified slot since /lean/v0/states/justified returns 404
-    // TODO: Find the correct endpoint for justified slot
-    const justified_slot = finalized_slot;
+    // Fetch justified slot from JSON checkpoint endpoint (zeam serves this)
+    const justified_slot = fetchJustifiedSlotFromJsonEndpoint(
+        allocator,
+        client,
+        base_url,
+    ) catch |err| {
+        log.debug("Justified checkpoint unavailable ({s}), using finalized slot", .{@errorName(err)});
+        return Slots{
+            .justified_slot = finalized_slot,
+            .finalized_slot = finalized_slot,
+        };
+    };
 
     return Slots{
         .justified_slot = justified_slot,
         .finalized_slot = finalized_slot,
     };
+}
+
+/// Fetch justified slot from /lean/v0/checkpoints/justified
+/// Returns JSON: {"root": "0x...", "slot": 123}
+fn fetchJustifiedSlotFromJsonEndpoint(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    base_url: []const u8,
+) !u64 {
+    var url_buf: [512]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "{s}/lean/v0/checkpoints/justified", .{base_url});
+    const uri = try std.Uri.parse(url);
+
+    var header_buf: [4096]u8 = undefined;
+    var req = try client.open(.GET, uri, .{
+        .server_header_buffer = &header_buf,
+        .extra_headers = &.{
+            .{ .name = "accept", .value = "application/json" },
+            .{ .name = "connection", .value = "close" },
+        },
+    });
+    defer req.deinit();
+
+    try req.send();
+    try req.finish();
+    try req.wait();
+
+    if (req.response.status != .ok) {
+        log.warn("Bad status from {s}: {any}", .{ url, req.response.status });
+        return error.BadStatus;
+    }
+
+    var body_buf = std.ArrayList(u8).init(allocator);
+    defer body_buf.deinit();
+    try req.reader().readAllArrayList(&body_buf, 64 * 1024);
+
+    const slot = parseJustifiedSlotFromJson(allocator, body_buf.items) catch |err| {
+        log.warn("Failed to parse justified checkpoint JSON from {s}: {}", .{ url, err });
+        return err;
+    };
+
+    log.debug("Successfully fetched justified slot {d} from {s}", .{ slot, url });
+    return slot;
+}
+
+/// Parse slot from justified checkpoint JSON: {"root": "0x...", "slot": N}
+fn parseJustifiedSlotFromJson(allocator: std.mem.Allocator, body: []const u8) !u64 {
+    var parser = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return error.InvalidJson;
+    defer parser.deinit();
+
+    const root = parser.value;
+    if (root != .object) return error.InvalidJson;
+    const obj = root.object;
+    const slot_val = obj.get("slot") orelse return error.MissingSlot;
+    const slot: u64 = switch (slot_val) {
+        .integer => |i| if (i >= 0) @intCast(i) else return error.InvalidSlot,
+        .float => |f| if (f >= 0 and f < 1e18) @intFromFloat(f) else return error.InvalidSlot,
+        else => return error.InvalidSlot,
+    };
+
+    const max_reasonable_slot: u64 = 1_000_000_000;
+    if (slot > max_reasonable_slot) return error.InvalidSlot;
+    return slot;
 }
 
 /// Fetch slot from SSZ-encoded endpoint
@@ -162,6 +236,12 @@ fn fetchSlotFromSSZEndpoint(
     out_state_ssz.* = try body_buf.toOwnedSlice();
 
     return slot;
+}
+
+test "parse justified checkpoint JSON" {
+    const json = "{\"root\":\"0x0000000000000000000000000000000000000000000000000000000000000000\",\"slot\":42}";
+    const slot = try parseJustifiedSlotFromJson(std.testing.allocator, json);
+    try std.testing.expectEqual(@as(u64, 42), slot);
 }
 
 test "extract slot from ssz bytes" {

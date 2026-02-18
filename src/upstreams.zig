@@ -198,12 +198,13 @@ pub const UpstreamManager = struct {
                 if (result.index >= self.upstreams.items.len) continue;
                 var upstream = &self.upstreams.items[result.index];
 
-                if (result.slots) |slots| {
+                    if (result.slots) |slots| {
                     // Success: clear error and update state
                     if (upstream.last_error) |old_err| {
                         self.allocator.free(old_err);
                         upstream.last_error = null;
                     }
+                    upstream.error_count = 0; // reset on success so UI reflects current health
                     upstream.last_slots = slots;
                     upstream.last_success_ms = now_ms;
 
