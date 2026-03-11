@@ -35,3 +35,24 @@ export interface HistoricalCheckpoint {
   timestamp: number;
   finalized: boolean;
 }
+
+export interface ForkChoiceCheckpoint {
+  slot: number;
+  root: string;
+}
+
+export interface ForkChoiceNode {
+  slot: number;
+  root: string;
+  parent_root: string;
+  weight: number;
+}
+
+export interface ForkChoiceResponse {
+  head: ForkChoiceCheckpoint;
+  justified: ForkChoiceCheckpoint;
+  finalized: ForkChoiceCheckpoint;
+  safe_target: { root: string };
+  validator_count: number;
+  nodes: ForkChoiceNode[];
+}

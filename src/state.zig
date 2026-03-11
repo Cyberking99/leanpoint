@@ -93,6 +93,7 @@ pub const AppState = struct {
         self.last_updated_ms = now_ms;
         self.last_success_ms = now_ms;
         self.last_latency_ms = latency_ms;
+        self.error_count = 0; // reset on success so UI reflects current health
         if (self.last_error) |msg| allocator.free(msg);
         self.last_error = null;
 
@@ -272,5 +273,5 @@ test "AppState updateSuccess clears error" {
 
     state.updateSuccess(std.testing.allocator, 100, 99, 50, 2000, null);
     try std.testing.expect(state.last_error == null);
-    try std.testing.expectEqual(@as(u64, 1), state.error_count); // error_count persists
+    try std.testing.expectEqual(@as(u64, 0), state.error_count); // reset on success
 }

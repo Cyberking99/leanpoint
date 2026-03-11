@@ -1,6 +1,7 @@
 const std = @import("std");
 const config_mod = @import("config.zig");
 const log = @import("log.zig");
+const lean_api = @import("lean_api.zig");
 const state_mod = @import("state.zig");
 const metrics_mod = @import("metrics.zig");
 
@@ -14,24 +15,39 @@ pub fn serve(
     defer net_server.deinit();
     log.info("Listening on {s}:{d}", .{ config.bind_address, config.bind_port });
 
+    // One request per connection to avoid Zig std.http.Server discardBody()
+    // unreachable when reusing the same connection (state machine bug).
     while (true) {
         var conn = try net_server.accept();
         defer conn.stream.close();
         var read_buffer: [16 * 1024]u8 = undefined;
         var http_server = std.http.Server.init(conn, &read_buffer);
 
-        while (true) {
-            var req = http_server.receiveHead() catch |err| switch (err) {
-                error.HttpConnectionClosing => break,
-                error.HttpRequestTruncated,
-                error.HttpHeadersOversize,
-                error.HttpHeadersInvalid,
-                error.HttpHeadersUnreadable,
-                => break,
-            };
-            try handleRequest(allocator, config, state, &req);
-        }
+        var req = http_server.receiveHead() catch |err| switch (err) {
+            error.HttpConnectionClosing => continue,
+            error.HttpRequestTruncated,
+            error.HttpHeadersOversize,
+            error.HttpHeadersInvalid,
+            error.HttpHeadersUnreadable,
+            => continue,
+        };
+        handleRequest(allocator, config, state, &req) catch continue;
     }
+}
+
+fn methodName(method: std.http.Method) []const u8 {
+    return switch (method) {
+        .GET => "GET",
+        .HEAD => "HEAD",
+        .POST => "POST",
+        .PUT => "PUT",
+        .DELETE => "DELETE",
+        .CONNECT => "CONNECT",
+        .OPTIONS => "OPTIONS",
+        .TRACE => "TRACE",
+        .PATCH => "PATCH",
+        else => "OTHER",
+    };
 }
 
 fn handleRequest(
@@ -43,7 +59,7 @@ fn handleRequest(
     const method = req.head.method;
     const target = req.head.target;
 
-    log.debug("{s} {s}", .{ @tagName(method), target });
+    log.debug("{s} {s}", .{ methodName(method), target });
 
     if (method != .GET and method != .HEAD) {
         try respondText(req, .method_not_allowed, "Method not allowed\n", "text/plain");
@@ -66,6 +82,10 @@ fn handleRequest(
     }
     if (std.mem.eql(u8, path, "/api/upstreams")) {
         try handleApiUpstreams(allocator, config, state, req);
+        return;
+    }
+    if (matchUpstreamForkChoicePath(path)) |upstream_name| {
+        try handleApiUpstreamForkChoice(allocator, config, state, req, upstream_name);
         return;
     }
     if (std.mem.eql(u8, path, "/lean/v0/states/finalized")) {
@@ -159,6 +179,8 @@ fn handleFinalizedState(
     };
     try req.respond(state_ssz, .{
         .status = .ok,
+        .keep_alive = false,
+        .transfer_encoding = .none,
         .extra_headers = &headers,
     });
 }
@@ -220,6 +242,58 @@ fn handleHealthz(
     } else {
         try respondText(req, .ok, "ok\n", "text/plain");
     }
+}
+
+fn matchUpstreamForkChoicePath(path: []const u8) ?[]const u8 {
+    const prefix = "/api/upstreams/";
+    const suffix = "/fork_choice";
+    if (path.len >= prefix.len + suffix.len + 1 and
+        std.mem.startsWith(u8, path, prefix) and
+        std.mem.endsWith(u8, path, suffix))
+    {
+        return path[prefix.len..][0 .. path.len - prefix.len - suffix.len];
+    }
+    return null;
+}
+
+fn handleApiUpstreamForkChoice(
+    allocator: std.mem.Allocator,
+    config: *const config_mod.Config,
+    state: *state_mod.AppState,
+    req: *std.http.Server.Request,
+    upstream_name: []const u8,
+) !void {
+    var upstreams_data = state.getUpstreamsData(allocator) catch |err| {
+        log.warn("getUpstreamsData failed: {}", .{err});
+        try respondText(req, .internal_server_error, "upstreams unavailable\n", "text/plain");
+        return;
+    };
+    defer upstreams_data.deinit(allocator);
+
+    const upstream = for (upstreams_data.upstreams) |u| {
+        if (std.mem.eql(u8, u.name, upstream_name)) break u;
+    } else {
+        try respondText(req, .not_found, "upstream not found\n", "text/plain");
+        return;
+    };
+
+    var client = std.http.Client{ .allocator = allocator };
+    defer client.deinit();
+    if (@hasField(std.http.Client, "connect_timeout")) {
+        client.connect_timeout = config.request_timeout_ms * std.time.ns_per_ms;
+    }
+    if (@hasField(std.http.Client, "read_timeout")) {
+        client.read_timeout = config.request_timeout_ms * std.time.ns_per_ms;
+    }
+
+    const body = lean_api.fetchForkChoice(allocator, &client, upstream.url) catch |err| {
+        log.warn("fetchForkChoice from {s} failed: {}", .{ upstream.url, err });
+        try respondText(req, .bad_gateway, "failed to fetch fork choice from upstream\n", "text/plain");
+        return;
+    };
+    defer allocator.free(body);
+
+    try respondText(req, .ok, body, "application/json");
 }
 
 fn handleApiUpstreams(
@@ -342,6 +416,8 @@ fn splitPath(target: []const u8) []const u8 {
     return iter.next() orelse target;
 }
 
+/// Respond with a text/JSON body. Uses keep_alive = false and transfer_encoding = .none
+/// to avoid Zig std.http.Server discardBody() unreachable when reusing connections.
 fn respondText(
     req: *std.http.Server.Request,
     status: std.http.Status,
@@ -353,6 +429,8 @@ fn respondText(
     };
     try req.respond(body, .{
         .status = status,
+        .keep_alive = false,
+        .transfer_encoding = .none,
         .extra_headers = &headers,
     });
 }

@@ -1,7 +1,11 @@
-# Multi-stage build for leanpoint
+# Multi-stage build for leanpoint (linux/amd64, linux/arm64)
 
 # Stage 1: Build stage
 FROM alpine:latest AS builder
+
+# TARGETARCH is set by docker buildx (amd64 or arm64)
+ARG TARGETARCH
+ARG ZIG_VERSION=0.14.1
 
 # Install build dependencies
 RUN apk add --no-cache \
@@ -11,11 +15,15 @@ RUN apk add --no-cache \
     nodejs \
     npm
 
-# Install Zig 0.14.1
-ARG ZIG_VERSION=0.14.1
-RUN curl -L -o /tmp/zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" && \
+# Install Zig 0.14.1 for the target architecture
+RUN case "$TARGETARCH" in \
+    amd64) ZIG_ARCH=x86_64 ;; \
+    arm64) ZIG_ARCH=aarch64 ;; \
+    *) echo "Unsupported TARGETARCH: $TARGETARCH"; exit 1 ;; \
+    esac && \
+    curl -L -o /tmp/zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz" && \
     tar -xJf /tmp/zig.tar.xz -C /usr/local && \
-    ln -s "/usr/local/zig-x86_64-linux-${ZIG_VERSION}/zig" /usr/local/bin/zig && \
+    ln -s "/usr/local/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}/zig" /usr/local/bin/zig && \
     rm /tmp/zig.tar.xz
 
 # Set working directory

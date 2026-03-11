@@ -108,14 +108,20 @@ function App() {
             <h3 style={{ fontSize: '1rem', fontWeight: 600, marginBottom: '0.5rem' }}>Quick Start</h3>
             <pre style={{ fontSize: '0.875rem', color: 'var(--text-secondary)', overflowX: 'auto' }}>
 {`# Poll status endpoint
-curl http://localhost:5555/status
+curl ${typeof window !== 'undefined' ? window.location.origin : 'http://localhost:5555'}/status
 
 # View Prometheus metrics
-curl http://localhost:5555/metrics
+curl ${typeof window !== 'undefined' ? window.location.origin : 'http://localhost:5555'}/metrics
 
 # Health check
-curl http://localhost:5555/healthz`}
+curl ${typeof window !== 'undefined' ? window.location.origin : 'http://localhost:5555'}/healthz`}
             </pre>
+            <p style={{ fontSize: '0.875rem', color: 'var(--text-secondary)', marginTop: '0.75rem', marginBottom: 0 }}>
+              <strong>API — Finalized state (SSZ):</strong>{' '}
+              <code style={{ wordBreak: 'break-all' }}>
+                {typeof window !== 'undefined' ? window.location.origin : 'http://localhost:5555'}/lean/v0/states/finalized
+              </code>
+            </p>
           </div>
         </section>
       </main>
