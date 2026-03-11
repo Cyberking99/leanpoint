@@ -244,6 +244,42 @@ test "parse justified checkpoint JSON" {
     try std.testing.expectEqual(@as(u64, 42), slot);
 }
 
+/// Fetch fork choice JSON from /lean/v0/fork_choice.
+/// Caller owns the returned slice.
+pub fn fetchForkChoice(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    base_url: []const u8,
+) ![]const u8 {
+    var url_buf: [512]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "{s}/lean/v0/fork_choice", .{base_url});
+    const uri = try std.Uri.parse(url);
+
+    var header_buf: [4096]u8 = undefined;
+    var req = try client.open(.GET, uri, .{
+        .server_header_buffer = &header_buf,
+        .extra_headers = &.{
+            .{ .name = "accept", .value = "application/json" },
+            .{ .name = "connection", .value = "close" },
+        },
+    });
+    defer req.deinit();
+
+    try req.send();
+    try req.finish();
+    try req.wait();
+
+    if (req.response.status != .ok) {
+        log.warn("Bad status from {s}: {any}", .{ url, req.response.status });
+        return error.BadStatus;
+    }
+
+    var body_buf = std.ArrayList(u8).init(allocator);
+    defer body_buf.deinit();
+    try req.reader().readAllArrayList(&body_buf, 1024 * 1024);
+    return body_buf.toOwnedSlice();
+}
+
 test "extract slot from ssz bytes" {
     // Simulate SSZ LeanState data
     var data: [300]u8 = undefined;

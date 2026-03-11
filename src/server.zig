@@ -1,6 +1,7 @@
 const std = @import("std");
 const config_mod = @import("config.zig");
 const log = @import("log.zig");
+const lean_api = @import("lean_api.zig");
 const state_mod = @import("state.zig");
 const metrics_mod = @import("metrics.zig");
 
@@ -81,6 +82,10 @@ fn handleRequest(
     }
     if (std.mem.eql(u8, path, "/api/upstreams")) {
         try handleApiUpstreams(allocator, config, state, req);
+        return;
+    }
+    if (matchUpstreamForkChoicePath(path)) |upstream_name| {
+        try handleApiUpstreamForkChoice(allocator, config, state, req, upstream_name);
         return;
     }
     if (std.mem.eql(u8, path, "/lean/v0/states/finalized")) {
@@ -237,6 +242,58 @@ fn handleHealthz(
     } else {
         try respondText(req, .ok, "ok\n", "text/plain");
     }
+}
+
+fn matchUpstreamForkChoicePath(path: []const u8) ?[]const u8 {
+    const prefix = "/api/upstreams/";
+    const suffix = "/fork_choice";
+    if (path.len >= prefix.len + suffix.len + 1 and
+        std.mem.startsWith(u8, path, prefix) and
+        std.mem.endsWith(u8, path, suffix))
+    {
+        return path[prefix.len..][0 .. path.len - prefix.len - suffix.len];
+    }
+    return null;
+}
+
+fn handleApiUpstreamForkChoice(
+    allocator: std.mem.Allocator,
+    config: *const config_mod.Config,
+    state: *state_mod.AppState,
+    req: *std.http.Server.Request,
+    upstream_name: []const u8,
+) !void {
+    var upstreams_data = state.getUpstreamsData(allocator) catch |err| {
+        log.warn("getUpstreamsData failed: {}", .{err});
+        try respondText(req, .internal_server_error, "upstreams unavailable\n", "text/plain");
+        return;
+    };
+    defer upstreams_data.deinit(allocator);
+
+    const upstream = for (upstreams_data.upstreams) |u| {
+        if (std.mem.eql(u8, u.name, upstream_name)) break u;
+    } else {
+        try respondText(req, .not_found, "upstream not found\n", "text/plain");
+        return;
+    };
+
+    var client = std.http.Client{ .allocator = allocator };
+    defer client.deinit();
+    if (@hasField(std.http.Client, "connect_timeout")) {
+        client.connect_timeout = config.request_timeout_ms * std.time.ns_per_ms;
+    }
+    if (@hasField(std.http.Client, "read_timeout")) {
+        client.read_timeout = config.request_timeout_ms * std.time.ns_per_ms;
+    }
+
+    const body = lean_api.fetchForkChoice(allocator, &client, upstream.url) catch |err| {
+        log.warn("fetchForkChoice from {s} failed: {}", .{ upstream.url, err });
+        try respondText(req, .bad_gateway, "failed to fetch fork choice from upstream\n", "text/plain");
+        return;
+    };
+    defer allocator.free(body);
+
+    try respondText(req, .ok, body, "application/json");
 }
 
 fn handleApiUpstreams(
