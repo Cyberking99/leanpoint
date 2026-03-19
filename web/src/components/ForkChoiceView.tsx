@@ -129,7 +129,28 @@ interface ForkChoiceViewProps {
   onClose: () => void;
 }
 
+function hasRequiredForkChoiceData(data: ForkChoiceResponse): boolean {
+  return (
+    data != null &&
+    data.head != null &&
+    typeof data.head.root === 'string' &&
+    data.justified != null &&
+    data.finalized != null &&
+    data.safe_target != null &&
+    typeof data.safe_target.root === 'string' &&
+    Array.isArray(data.nodes)
+  );
+}
+
 export function ForkChoiceView({ data }: ForkChoiceViewProps) {
+  if (!hasRequiredForkChoiceData(data)) {
+    return (
+      <div className="error-message" style={{ margin: '1rem 0' }}>
+        Invalid or unsupported fork choice data from upstream. The node may not expose the lean fork_choice API.
+      </div>
+    );
+  }
+
   const childrenMap = buildChildrenMap(data.nodes);
   const roots = getRoots(data.nodes);
 
