@@ -104,9 +104,11 @@ pub const Poller = struct {
 
     /// Poll multiple upstreams with consensus
     fn pollMulti(self: *Poller, manager: *upstreams_mod.UpstreamManager, now_ms: i64) !void {
-        // Poll all upstreams and get consensus
+        // Poll all upstreams concurrently and get consensus.
+        // self.client is passed for API compatibility but each upstream spawns its own
+        // client internally to avoid shared-state hangs.
         var state_ssz: ?[]u8 = null;
-        const consensus_slots = manager.pollUpstreams(&self.client, now_ms, &state_ssz);
+        const consensus_slots = manager.pollUpstreams(&self.client, now_ms, self.config.request_timeout_ms, &state_ssz);
 
         if (consensus_slots) |slots| {
             const latency_ms: u64 = 0; // Latency not tracked in multi-upstream mode
