@@ -164,10 +164,10 @@ fn fetchSlotFromSSZEndpoint(
     errdefer body_buf.deinit();
 
     // Optimize buffer size based on endpoint
-    // Finalized/justified states are typically 1-2MB in SSZ format
+    // Finalized states grow with chain length; 16MB accommodates states well beyond devnet scale
     // Other endpoints (health, metrics) are much smaller
     const max_bytes: usize = if (std.mem.indexOf(u8, path, "states") != null)
-        2 * 1024 * 1024 // 2MB for state endpoints
+        16 * 1024 * 1024 // 16MB for state endpoints
     else
         64 * 1024; // 64KB for other endpoints
 
