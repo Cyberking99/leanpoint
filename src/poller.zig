@@ -79,6 +79,7 @@ pub const Poller = struct {
             self.config.lean_api_base_url,
             self.config.lean_api_path,
             &state_ssz,
+            self.config.request_timeout_ms,
         ) catch |err| {
             var msg_buf = std.ArrayList(u8).init(self.allocator);
             defer msg_buf.deinit();

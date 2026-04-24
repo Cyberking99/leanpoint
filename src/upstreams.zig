@@ -126,6 +126,11 @@ pub const UpstreamManager = struct {
         base_url: []u8,
         path: []u8,
         name: []u8,
+        // Socket-level timeout applied to the HTTP request inside the worker.
+        // Bounds the worker's lifetime so detached threads clean up their
+        // sockets within a predictable window (rather than hanging for the
+        // kernel's TCP retransmit window on unresponsive peers).
+        timeout_ms: u64,
         // written by the thread, read by the spawner after deadline
         done: std.atomic.Value(bool),
         slots: ?lean_api.Slots,
@@ -139,6 +144,7 @@ pub const UpstreamManager = struct {
             name: []const u8,
             base_url: []const u8,
             path: []const u8,
+            timeout_ms: u64,
         ) !*PollCtx {
             const ctx = try allocator.create(PollCtx);
             ctx.* = .{
@@ -147,6 +153,7 @@ pub const UpstreamManager = struct {
                 .name = try allocator.dupe(u8, name),
                 .base_url = try allocator.dupe(u8, base_url),
                 .path = try allocator.dupe(u8, path),
+                .timeout_ms = timeout_ms,
                 .done = std.atomic.Value(bool).init(false),
                 .slots = null,
                 .error_msg = null,
@@ -184,6 +191,7 @@ pub const UpstreamManager = struct {
             ctx.base_url,
             ctx.path,
             &state_ssz,
+            ctx.timeout_ms,
         ) catch |err| {
             ctx.error_msg = std.fmt.allocPrint(ctx.allocator, "{s}", .{@errorName(err)}) catch null;
             ctx.done.store(true, .release);
@@ -246,6 +254,7 @@ pub const UpstreamManager = struct {
                 target.name,
                 target.base_url,
                 target.path,
+                timeout_ms,
             ) catch |err| {
                 log.warn("Failed to allocate poll context for {s}: {s}", .{ target.name, @errorName(err) });
                 continue;
