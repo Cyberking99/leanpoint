@@ -286,7 +286,7 @@ fn handleApiUpstreamForkChoice(
         client.read_timeout = config.request_timeout_ms * std.time.ns_per_ms;
     }
 
-    const body = lean_api.fetchForkChoice(allocator, &client, upstream.url) catch |err| {
+    const body = lean_api.fetchForkChoice(allocator, &client, upstream.url, config.request_timeout_ms) catch |err| {
         log.warn("fetchForkChoice from {s} failed: {}", .{ upstream.url, err });
         try respondText(req, .bad_gateway, "failed to fetch fork choice from upstream\n", "text/plain");
         return;
