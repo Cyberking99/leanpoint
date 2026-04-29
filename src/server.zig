@@ -335,8 +335,18 @@ fn handleApiUpstreams(
             last_error_json = try jsonString(allocator, msg);
         }
 
+        const is_aggregator_json: []const u8 = if (upstream.is_aggregator) |a|
+            if (a) "true" else "false"
+        else
+            "null";
+        const head_slot_json: []const u8 = if (upstream.head_slot) |slot| blk: {
+            var num_buf: [32]u8 = undefined;
+            const num_str = try std.fmt.bufPrint(&num_buf, "{d}", .{slot});
+            break :blk num_str;
+        } else "null";
+
         try writer.print(
-            \\{{"name":{s},"url":{s},"path":{s},"healthy":{s},"last_success_ms":{s},"error_count":{d},"last_error":{s},"last_justified_slot":{s},"last_finalized_slot":{s}}}
+            \\{{"name":{s},"url":{s},"path":{s},"healthy":{s},"last_success_ms":{s},"error_count":{d},"last_error":{s},"last_justified_slot":{s},"last_finalized_slot":{s},"is_aggregator":{s},"head_slot":{s}}}
         , .{
             name_json,
             url_json,
@@ -361,6 +371,8 @@ fn handleApiUpstreams(
                 const num_str = try std.fmt.bufPrint(&num_buf, "{d}", .{slot});
                 break :blk num_str;
             } else "null",
+            is_aggregator_json,
+            head_slot_json,
         });
     }
 

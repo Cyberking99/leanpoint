@@ -120,6 +120,130 @@ fn fetchJustifiedSlotFromJsonEndpoint(
     return slot;
 }
 
+/// GET /lean/v0/admin/aggregator — JSON `{"is_aggregator": <bool>}` (Zeam; optional on other clients).
+/// Returns `null` if the endpoint is missing or the response is not valid JSON.
+pub fn fetchAggregatorOptional(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    base_url: []const u8,
+    timeout_ms: u64,
+) ?bool {
+    return fetchAggregatorOptionalImpl(allocator, client, base_url, timeout_ms) catch null;
+}
+
+fn fetchAggregatorOptionalImpl(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    base_url: []const u8,
+    timeout_ms: u64,
+) !bool {
+    var url_buf: [512]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "{s}/lean/v0/admin/aggregator", .{base_url});
+    const uri = try std.Uri.parse(url);
+
+    var header_buf: [4096]u8 = undefined;
+    var req = try client.open(.GET, uri, .{
+        .server_header_buffer = &header_buf,
+        .extra_headers = &.{
+            .{ .name = "accept", .value = "application/json" },
+            .{ .name = "connection", .value = "close" },
+        },
+    });
+    defer req.deinit();
+    applySocketTimeouts(&req, timeout_ms);
+
+    try req.send();
+    try req.finish();
+    try req.wait();
+
+    switch (req.response.status) {
+        .ok => {},
+        .not_found, .method_not_allowed, .not_implemented => return error.UnsupportedEndpoint,
+        else => return error.BadStatus,
+    }
+
+    var body_buf = std.ArrayList(u8).init(allocator);
+    defer body_buf.deinit();
+    try req.reader().readAllArrayList(&body_buf, 4 * 1024);
+
+    var parser = std.json.parseFromSlice(std.json.Value, allocator, body_buf.items, .{}) catch return error.BadJson;
+    defer parser.deinit();
+    if (parser.value != .object) return error.BadJson;
+    const b = parser.value.object.get("is_aggregator") orelse return error.MissingField;
+    return switch (b) {
+        .bool => |v| v,
+        else => return error.InvalidFieldType,
+    };
+}
+
+/// GET /lean/v0/fork_choice and read `head.slot` from the JSON (Lean HTTP API on Zeam and compatible clients).
+/// Returns `null` on failure or missing `head`.
+pub fn fetchHeadSlotOptional(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    base_url: []const u8,
+    timeout_ms: u64,
+) ?u64 {
+    return fetchHeadSlotOptionalImpl(allocator, client, base_url, timeout_ms) catch null;
+}
+
+fn fetchHeadSlotOptionalImpl(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    base_url: []const u8,
+    timeout_ms: u64,
+) !u64 {
+    var url_buf: [512]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "{s}/lean/v0/fork_choice", .{base_url});
+    const uri = try std.Uri.parse(url);
+
+    var header_buf: [4096]u8 = undefined;
+    var req = try client.open(.GET, uri, .{
+        .server_header_buffer = &header_buf,
+        .extra_headers = &.{
+            .{ .name = "accept", .value = "application/json" },
+            .{ .name = "connection", .value = "close" },
+        },
+    });
+    defer req.deinit();
+    applySocketTimeouts(&req, timeout_ms);
+
+    try req.send();
+    try req.finish();
+    try req.wait();
+
+    if (req.response.status != .ok) {
+        return error.BadStatus;
+    }
+
+    var body_buf = std.ArrayList(u8).init(allocator);
+    defer body_buf.deinit();
+    try req.reader().readAllArrayList(&body_buf, 1024 * 1024);
+
+    return parseHeadSlotFromForkChoiceJson(allocator, body_buf.items) catch |err| {
+        log.debug("head slot from fork_choice at {s}: {s}", .{ url, @errorName(err) });
+        return error.ParseFailed;
+    };
+}
+
+/// Extract `head.slot` from /lean/v0/fork_choice JSON.
+fn parseHeadSlotFromForkChoiceJson(allocator: std.mem.Allocator, body: []const u8) !u64 {
+    var parser = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return error.InvalidJson;
+    defer parser.deinit();
+    if (parser.value != .object) return error.InvalidJson;
+    const head_val = parser.value.object.get("head") orelse return error.MissingField;
+    if (head_val != .object) return error.InvalidJson;
+    const slot_val = head_val.object.get("slot") orelse return error.MissingField;
+    const slot: u64 = switch (slot_val) {
+        .integer => |i| if (i >= 0) @intCast(i) else return error.InvalidSlot,
+        .float => |f| if (f >= 0 and f < 1e18) @intFromFloat(f) else return error.InvalidSlot,
+        else => return error.InvalidSlot,
+    };
+    const max_reasonable_slot: u64 = 1_000_000_000;
+    if (slot > max_reasonable_slot) return error.InvalidSlot;
+    return slot;
+}
+
 /// Parse slot from justified checkpoint JSON: {"root": "0x...", "slot": N}
 fn parseJustifiedSlotFromJson(allocator: std.mem.Allocator, body: []const u8) !u64 {
     var parser = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return error.InvalidJson;

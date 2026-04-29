@@ -63,8 +63,13 @@ def convert_validator_config(
         if docker_host:
             ip = "host.docker.internal"
 
-        # Use metricsPort from config when present (validator-config uses it for API)
-        http_port = validator.get('metricsPort', base_port + idx)
+        # Prefer apiPort (Lean HTTP API) over metricsPort (Prometheus).
+        # Older validator-config.yaml files only had metricsPort, so fall back
+        # to it for backwards compatibility, then to base_port+idx.
+        http_port = validator.get(
+            'apiPort',
+            validator.get('metricsPort', base_port + idx),
+        )
 
         upstream = {
             "name": name,

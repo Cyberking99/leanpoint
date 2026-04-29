@@ -88,6 +88,8 @@ export const UpstreamsTable = ({ data, loading, error }: UpstreamsTableProps) =>
           <tr>
             <th>Name</th>
             <th>Status</th>
+            <th>Aggregator</th>
+            <th>Head</th>
             <th>Finalized</th>
             <th>Justified</th>
             <th>Errors</th>
@@ -121,6 +123,16 @@ export const UpstreamsTable = ({ data, loading, error }: UpstreamsTableProps) =>
                 <span className={`status-badge ${upstream.healthy ? 'healthy' : 'unhealthy'}`}>
                   {upstream.healthy ? 'Healthy' : 'Unhealthy'}
                 </span>
+              </td>
+              <td>
+                {upstream.is_aggregator == null
+                  ? 'N/A'
+                  : upstream.is_aggregator
+                    ? 'Yes'
+                    : 'No'}
+              </td>
+              <td>
+                {upstream.head_slot != null ? upstream.head_slot.toLocaleString() : 'N/A'}
               </td>
               <td>
                 {upstream.last_finalized_slot !== null

@@ -18,6 +18,10 @@ export interface Upstream {
   last_error: string | null;
   last_justified_slot: number | null;
   last_finalized_slot: number | null;
+  /** true/false from /lean/v0/admin/aggregator when the client supports it */
+  is_aggregator: boolean | null;
+  /** head.slot from /lean/v0/fork_choice when available */
+  head_slot: number | null;
 }
 
 export interface UpstreamsResponse {

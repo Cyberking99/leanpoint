@@ -11,6 +11,10 @@ pub const Upstream = struct {
     last_success_ms: i64,
     error_count: u64,
     last_error: ?[]const u8,
+    /// From GET /lean/v0/admin/aggregator when supported; null if unknown
+    is_aggregator: ?bool,
+    /// From GET /lean/v0/fork_choice `head.slot` when available; null if unknown
+    head_slot: ?u64,
 
     pub fn init(allocator: std.mem.Allocator, name: []const u8, base_url: []const u8, path: []const u8) !Upstream {
         return Upstream{
@@ -21,6 +25,8 @@ pub const Upstream = struct {
             .last_success_ms = 0,
             .error_count = 0,
             .last_error = null,
+            .is_aggregator = null,
+            .head_slot = null,
         };
     }
 
@@ -102,6 +108,8 @@ pub const UpstreamManager = struct {
         slots: ?lean_api.Slots,
         error_msg: ?[]const u8,
         state_ssz: ?[]u8,
+        is_aggregator: ?bool,
+        head_slot: ?u64,
     };
 
     // ---------------------------------------------------------------------------
@@ -136,6 +144,8 @@ pub const UpstreamManager = struct {
         slots: ?lean_api.Slots,
         error_msg: ?[]u8,
         state_ssz: ?[]u8,
+        is_aggregator: ?bool,
+        head_slot: ?u64,
         ref_count: std.atomic.Value(u32),
 
         fn create(
@@ -158,6 +168,8 @@ pub const UpstreamManager = struct {
                 .slots = null,
                 .error_msg = null,
                 .state_ssz = null,
+                .is_aggregator = null,
+                .head_slot = null,
                 .ref_count = std.atomic.Value(u32).init(2),
             };
             return ctx;
@@ -197,6 +209,11 @@ pub const UpstreamManager = struct {
             ctx.done.store(true, .release);
             return;
         };
+
+        // Extra lean HTTP calls share part of the poll budget (avoid 3× full timeout).
+        const sub_to = @max(2_000, ctx.timeout_ms / 2);
+        ctx.is_aggregator = lean_api.fetchAggregatorOptional(ctx.allocator, &client, ctx.base_url, sub_to);
+        ctx.head_slot = lean_api.fetchHeadSlotOptional(ctx.allocator, &client, ctx.base_url, sub_to);
 
         ctx.slots = slots;
         ctx.state_ssz = state_ssz;
@@ -320,6 +337,8 @@ pub const UpstreamManager = struct {
                     .slots = null,
                     .error_msg = error_msg,
                     .state_ssz = null,
+                    .is_aggregator = null,
+                    .head_slot = null,
                 }) catch continue;
                 continue;
             }
@@ -337,6 +356,8 @@ pub const UpstreamManager = struct {
                     .slots = slots,
                     .error_msg = null,
                     .state_ssz = ssz,
+                    .is_aggregator = ctx.is_aggregator,
+                    .head_slot = ctx.head_slot,
                 }) catch continue;
             } else {
                 const err_copy = if (ctx.error_msg) |m| self.allocator.dupe(u8, m) catch null else null;
@@ -350,6 +371,8 @@ pub const UpstreamManager = struct {
                     .slots = null,
                     .error_msg = err_copy,
                     .state_ssz = null,
+                    .is_aggregator = null,
+                    .head_slot = null,
                 }) catch continue;
             }
         }
@@ -376,6 +399,8 @@ pub const UpstreamManager = struct {
                     upstream.error_count = 0;
                     upstream.last_slots = slots;
                     upstream.last_success_ms = now_ms;
+                    upstream.is_aggregator = result.is_aggregator;
+                    upstream.head_slot = result.head_slot;
 
                     const slot_key: u128 = (@as(u128, slots.justified_slot) << 64) | @as(u128, slots.finalized_slot);
                     const count = slot_counts.get(slot_key) orelse 0;
@@ -386,6 +411,8 @@ pub const UpstreamManager = struct {
                     upstream.error_count += 1;
                     if (upstream.last_error) |old_err| self.allocator.free(old_err);
                     upstream.last_error = result.error_msg;
+                    upstream.is_aggregator = null;
+                    upstream.head_slot = null;
                     results.items[i].error_msg = null; // ownership transferred
                 }
             }

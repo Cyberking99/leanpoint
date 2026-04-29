@@ -25,6 +25,8 @@ pub const UpstreamInfo = struct {
     last_error: ?[]u8,
     last_justified_slot: ?u64,
     last_finalized_slot: ?u64,
+    is_aggregator: ?bool,
+    head_slot: ?u64,
 
     pub fn deinit(self: *UpstreamInfo, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
@@ -178,6 +180,8 @@ pub const AppState = struct {
                     .last_error = last_error_copy,
                     .last_justified_slot = if (upstream.last_slots) |slots| slots.justified_slot else null,
                     .last_finalized_slot = if (upstream.last_slots) |slots| slots.finalized_slot else null,
+                    .is_aggregator = upstream.is_aggregator,
+                    .head_slot = upstream.head_slot,
                 };
             }
 
