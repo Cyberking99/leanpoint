@@ -103,13 +103,17 @@ pub const Poller = struct {
         }
     }
 
-    /// Poll multiple upstreams with consensus
+    /// Poll multiple upstreams with consensus (bounded worker pool in upstreams.zig).
+    /// `self.client` is only passed for API compatibility; workers use their own clients.
     fn pollMulti(self: *Poller, manager: *upstreams_mod.UpstreamManager, now_ms: i64) !void {
-        // Poll all upstreams concurrently and get consensus.
-        // self.client is passed for API compatibility but each upstream spawns its own
-        // client internally to avoid shared-state hangs.
         var state_ssz: ?[]u8 = null;
-        const consensus_slots = manager.pollUpstreams(&self.client, now_ms, self.config.request_timeout_ms, &state_ssz);
+        const consensus_slots = manager.pollUpstreams(
+            &self.client,
+            now_ms,
+            self.config.request_timeout_ms,
+            self.config.poll_max_concurrency,
+            &state_ssz,
+        );
 
         if (consensus_slots) |slots| {
             const latency_ms: u64 = 0; // Latency not tracked in multi-upstream mode
@@ -140,6 +144,7 @@ test "poller initialization" {
         .lean_api_path = try std.testing.allocator.dupe(u8, "/status"),
         .poll_interval_ms = 10_000,
         .request_timeout_ms = 5_000,
+        .poll_max_concurrency = 16,
         .stale_after_ms = 30_000,
         .static_dir = null,
         .upstreams_config = null,

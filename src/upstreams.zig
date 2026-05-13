@@ -106,133 +106,86 @@ pub const UpstreamManager = struct {
     const PollResult = struct {
         index: usize,
         slots: ?lean_api.Slots,
-        error_msg: ?[]const u8,
-        state_ssz: ?[]u8,
-        is_aggregator: ?bool,
-        head_slot: ?u64,
-    };
-
-    // ---------------------------------------------------------------------------
-    // Concurrent per-upstream polling context.
-    //
-    // Zig 0.14's std.http.Client does not expose connect_timeout / read_timeout,
-    // so a single hung TCP connection would stall the entire sequential poll loop
-    // forever.  The fix: spawn one thread per upstream and wait for all of them
-    // behind a hard deadline (request_timeout_ms).  If an upstream doesn't answer
-    // in time its thread is detached; it will free its own memory when it
-    // eventually returns (reference-counted via an atomic counter).
-    // ---------------------------------------------------------------------------
-
-    /// Heap-allocated context shared between the spawner and the worker thread.
-    /// Reference-counted (starts at 2: one for the spawner, one for the thread).
-    /// Freed automatically when the last holder calls release().
-    const PollCtx = struct {
-        allocator: std.mem.Allocator,
-        index: usize,
-        // owned copies of the target strings so the thread stays safe even after
-        // a timeout when the spawner has already moved on.
-        base_url: []u8,
-        path: []u8,
-        name: []u8,
-        // Socket-level timeout applied to the HTTP request inside the worker.
-        // Bounds the worker's lifetime so detached threads clean up their
-        // sockets within a predictable window (rather than hanging for the
-        // kernel's TCP retransmit window on unresponsive peers).
-        timeout_ms: u64,
-        // written by the thread, read by the spawner after deadline
-        done: std.atomic.Value(bool),
-        slots: ?lean_api.Slots,
         error_msg: ?[]u8,
         state_ssz: ?[]u8,
         is_aggregator: ?bool,
         head_slot: ?u64,
-        ref_count: std.atomic.Value(u32),
-
-        fn create(
-            allocator: std.mem.Allocator,
-            index: usize,
-            name: []const u8,
-            base_url: []const u8,
-            path: []const u8,
-            timeout_ms: u64,
-        ) !*PollCtx {
-            const ctx = try allocator.create(PollCtx);
-            ctx.* = .{
-                .allocator = allocator,
-                .index = index,
-                .name = try allocator.dupe(u8, name),
-                .base_url = try allocator.dupe(u8, base_url),
-                .path = try allocator.dupe(u8, path),
-                .timeout_ms = timeout_ms,
-                .done = std.atomic.Value(bool).init(false),
-                .slots = null,
-                .error_msg = null,
-                .state_ssz = null,
-                .is_aggregator = null,
-                .head_slot = null,
-                .ref_count = std.atomic.Value(u32).init(2),
-            };
-            return ctx;
-        }
-
-        /// Drop one reference; destroy when both holders have released.
-        fn release(self: *PollCtx) void {
-            if (self.ref_count.fetchSub(1, .acq_rel) == 1) {
-                self.allocator.free(self.name);
-                self.allocator.free(self.base_url);
-                self.allocator.free(self.path);
-                if (self.error_msg) |m| self.allocator.free(m);
-                if (self.state_ssz) |s| self.allocator.free(s);
-                self.allocator.destroy(self);
-            }
-        }
     };
 
-    /// Worker thread: creates its own HTTP client, fetches slots, writes result,
-    /// then releases its reference to the context.
-    fn pollUpstreamThread(ctx: *PollCtx) void {
-        defer ctx.release();
+    /// Shared work queue for bounded-concurrency poll workers.
+    const PollWork = struct {
+        allocator: std.mem.Allocator,
+        targets: []const PollTarget,
+        results: []PollResult,
+        next: std.atomic.Value(usize),
+        timeout_ms: u64,
+    };
 
-        var client = std.http.Client{ .allocator = ctx.allocator };
+    fn pollUpstreamWorker(work: *PollWork) void {
+        while (true) {
+            const wi = work.next.fetchAdd(1, .monotonic);
+            if (wi >= work.targets.len) break;
+            work.results[wi] = pollOneUpstream(work.allocator, work.targets[wi], work.timeout_ms);
+        }
+    }
+
+    /// One upstream: own HTTP client (no cross-thread sharing), socket timeouts in lean_api.
+    fn pollOneUpstream(allocator: std.mem.Allocator, target: PollTarget, timeout_ms: u64) PollResult {
+        var client = std.http.Client{ .allocator = allocator };
         defer client.deinit();
 
         var state_ssz: ?[]u8 = null;
         const slots = lean_api.fetchSlots(
-            ctx.allocator,
+            allocator,
             &client,
-            ctx.base_url,
-            ctx.path,
+            target.base_url,
+            target.path,
             &state_ssz,
-            ctx.timeout_ms,
+            timeout_ms,
         ) catch |err| {
-            ctx.error_msg = std.fmt.allocPrint(ctx.allocator, "{s}", .{@errorName(err)}) catch null;
-            ctx.done.store(true, .release);
-            return;
+            const msg = std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)}) catch null;
+            if (state_ssz) |s| allocator.free(s);
+            log.warn("Upstream {s} ({s}) failed: {s}", .{ target.name, target.base_url, @errorName(err) });
+            return .{
+                .index = target.index,
+                .slots = null,
+                .error_msg = msg,
+                .state_ssz = null,
+                .is_aggregator = null,
+                .head_slot = null,
+            };
         };
 
-        // Extra lean HTTP calls share part of the poll budget (avoid 3× full timeout).
-        const sub_to = @max(2_000, ctx.timeout_ms / 2);
-        ctx.is_aggregator = lean_api.fetchAggregatorOptional(ctx.allocator, &client, ctx.base_url, sub_to);
-        ctx.head_slot = lean_api.fetchHeadSlotOptional(ctx.allocator, &client, ctx.base_url, sub_to);
+        const sub_to = @max(2_000, timeout_ms / 2);
+        const is_aggregator = lean_api.fetchAggregatorOptional(allocator, &client, target.base_url, sub_to);
+        const head_slot = lean_api.fetchHeadSlotOptional(allocator, &client, target.base_url, sub_to);
 
-        ctx.slots = slots;
-        ctx.state_ssz = state_ssz;
-        ctx.done.store(true, .release);
+        log.debug("Upstream {s}: justified={d}, finalized={d}", .{
+            target.name, slots.justified_slot, slots.finalized_slot,
+        });
+
+        return .{
+            .index = target.index,
+            .slots = slots,
+            .error_msg = null,
+            .state_ssz = state_ssz,
+            .is_aggregator = is_aggregator,
+            .head_slot = head_slot,
+        };
     }
 
-    /// Poll all upstreams concurrently and return consensus slots if 50%+ agree.
+    /// Poll upstreams with a bounded worker pool, then require 50%+ agreement on slots.
     ///
-    /// Each upstream is polled in its own OS thread.  After spawning all threads
-    /// the function waits up to timeout_ms for them all to finish.  Any thread
-    /// still running at the deadline is abandoned (detached); its PollCtx is
-    /// reference-counted so it cleans up itself when it eventually completes.
+    /// Each worker pulls the next upstream from a queue (own `std.http.Client` per poll).
+    /// This caps OS threads and parallel 16MB SSZ downloads when many nodes are configured,
+    /// while `lean_api` socket timeouts still bound each hung TCP connection.
     pub fn pollUpstreams(
         self: *UpstreamManager,
-        // client parameter kept for API compatibility but is no longer used here;
-        // each thread creates its own client to avoid shared-state data races.
+        // Kept for API compatibility; each worker creates its own client.
         _: *std.http.Client,
         now_ms: i64,
         timeout_ms: u64,
+        max_concurrency: u32,
         out_state_ssz: *?[]u8,
     ) ?lean_api.Slots {
         // Step 1: snapshot upstreams (brief lock)
@@ -257,127 +210,53 @@ pub const UpstreamManager = struct {
 
         if (targets.items.len == 0) return null;
 
-        // Step 2: spawn one thread per upstream
-        var ctxs = std.ArrayList(*PollCtx).init(self.allocator);
+        const n = targets.items.len;
+        const max_w = @min(max_concurrency, 256);
+        const cap: usize = @max(1, @min(@as(usize, @intCast(max_w)), n));
+        if (cap < n) {
+            log.debug("Polling {d} upstreams with concurrency {d} (≤{d} OS threads this tick)", .{ n, cap, cap });
+        }
+
+        const results = self.allocator.alloc(PollResult, n) catch {
+            log.warn("Failed to allocate poll result buffer", .{});
+            return null;
+        };
         defer {
-            for (ctxs.items) |ctx| ctx.release(); // spawner releases its ref
-            ctxs.deinit();
-        }
-
-        for (targets.items) |target| {
-            const ctx = PollCtx.create(
-                self.allocator,
-                target.index,
-                target.name,
-                target.base_url,
-                target.path,
-                timeout_ms,
-            ) catch |err| {
-                log.warn("Failed to allocate poll context for {s}: {s}", .{ target.name, @errorName(err) });
-                continue;
-            };
-
-            const thread = std.Thread.spawn(.{}, pollUpstreamThread, .{ctx}) catch |err| {
-                log.warn("Failed to spawn poll thread for {s}: {s}", .{ target.name, @errorName(err) });
-                ctx.release(); // thread never ran — release thread's ref too
-                ctx.release(); // release spawner's ref
-                continue;
-            };
-            thread.detach();
-
-            ctxs.append(ctx) catch {
-                // append failed; ctx's thread is already running and holds its own ref,
-                // so just release the spawner's ref.
-                ctx.release();
-                continue;
-            };
-        }
-
-        if (ctxs.items.len == 0) return null;
-
-        // Step 3: wait for all threads behind a hard deadline
-        const deadline_ms = now_ms + @as(i64, @intCast(timeout_ms));
-        while (std.time.milliTimestamp() < deadline_ms) {
-            var all_done = true;
-            for (ctxs.items) |ctx| {
-                if (!ctx.done.load(.acquire)) {
-                    all_done = false;
-                    break;
-                }
-            }
-            if (all_done) break;
-            std.time.sleep(5 * std.time.ns_per_ms);
-        }
-
-        // Log any upstreams that timed out
-        for (ctxs.items) |ctx| {
-            if (!ctx.done.load(.acquire)) {
-                log.warn("Upstream {s} ({s}) timed out after {d}ms — detaching thread", .{
-                    ctx.name, ctx.base_url, timeout_ms,
-                });
-            }
-        }
-
-        // Step 4: collect results from completed threads and update upstream state
-        var results = std.ArrayList(PollResult).init(self.allocator);
-        defer {
-            for (results.items) |result| {
+            for (results) |result| {
                 if (result.error_msg) |msg| self.allocator.free(msg);
                 if (result.state_ssz) |blob| self.allocator.free(blob);
             }
-            results.deinit();
+            self.allocator.free(results);
         }
 
-        for (ctxs.items) |ctx| {
-            if (!ctx.done.load(.acquire)) {
-                // Timed out — record as an error so the upstream shows as failing
-                const error_msg = self.allocator.dupe(u8, "timeout") catch null;
-                results.append(PollResult{
-                    .index = ctx.index,
-                    .slots = null,
-                    .error_msg = error_msg,
-                    .state_ssz = null,
-                    .is_aggregator = null,
-                    .head_slot = null,
-                }) catch continue;
-                continue;
-            }
+        var work = PollWork{
+            .allocator = self.allocator,
+            .targets = targets.items,
+            .results = results,
+            .next = std.atomic.Value(usize).init(0),
+            .timeout_ms = timeout_ms,
+        };
 
-            if (ctx.slots) |slots| {
-                log.debug("Upstream {s}: justified={d}, finalized={d}", .{
-                    ctx.name, slots.justified_slot, slots.finalized_slot,
-                });
-                // Transfer ownership of SSZ blob out of the ctx before ctx.release()
-                // is called by the defer above.  We null it in ctx to avoid double-free.
-                const ssz = ctx.state_ssz;
-                ctx.state_ssz = null;
-                results.append(PollResult{
-                    .index = ctx.index,
-                    .slots = slots,
-                    .error_msg = null,
-                    .state_ssz = ssz,
-                    .is_aggregator = ctx.is_aggregator,
-                    .head_slot = ctx.head_slot,
-                }) catch continue;
-            } else {
-                const err_copy = if (ctx.error_msg) |m| self.allocator.dupe(u8, m) catch null else null;
-                log.warn("Upstream {s} ({s}) failed: {s}", .{
-                    ctx.name,
-                    ctx.base_url,
-                    ctx.error_msg orelse "unknown",
-                });
-                results.append(PollResult{
-                    .index = ctx.index,
-                    .slots = null,
-                    .error_msg = err_copy,
-                    .state_ssz = null,
-                    .is_aggregator = null,
-                    .head_slot = null,
-                }) catch continue;
-            }
+        const threads = self.allocator.alloc(std.Thread, cap) catch {
+            log.warn("Failed to allocate thread handles for upstream poll", .{});
+            return null;
+        };
+        defer self.allocator.free(threads);
+
+        var spawned: usize = 0;
+
+        for (0..cap) |_| {
+            threads[spawned] = std.Thread.spawn(.{}, pollUpstreamWorker, .{&work}) catch |err| {
+                log.warn("Failed to spawn poll worker ({d}/{d}): {s}", .{ spawned, cap, @errorName(err) });
+                for (0..spawned) |j| threads[j].join();
+                return null;
+            };
+            spawned += 1;
         }
 
-        // Step 5: Update upstream states (brief lock)
+        for (0..spawned) |j| threads[j].join();
+
+        // Step 2: Update upstream states (brief lock)
         var slot_counts = std.AutoHashMap(u128, u32).init(self.allocator);
         defer slot_counts.deinit();
 
@@ -387,7 +266,7 @@ pub const UpstreamManager = struct {
             self.mutex.lock();
             defer self.mutex.unlock();
 
-            for (results.items, 0..) |*result, i| {
+            for (results, 0..) |*result, i| {
                 if (result.index >= self.upstreams.items.len) continue;
                 var upstream = &self.upstreams.items[result.index];
 
@@ -413,7 +292,7 @@ pub const UpstreamManager = struct {
                     upstream.last_error = result.error_msg;
                     upstream.is_aggregator = null;
                     upstream.head_slot = null;
-                    results.items[i].error_msg = null; // ownership transferred
+                    results[i].error_msg = null; // ownership transferred
                 }
             }
         }
@@ -433,12 +312,12 @@ pub const UpstreamManager = struct {
                 const justified_slot: u64 = @truncate(slot_key >> 64);
                 const finalized_slot: u64 = @truncate(slot_key & 0xFFFFFFFFFFFFFFFF);
 
-                for (results.items, 0..) |*res, i| {
+                for (results, 0..) |*res, i| {
                     if (res.slots) |s| {
                         if (s.justified_slot == justified_slot and s.finalized_slot == finalized_slot) {
                             if (res.state_ssz) |blob| {
                                 out_state_ssz.* = blob;
-                                results.items[i].state_ssz = null;
+                                results[i].state_ssz = null;
                                 break;
                             }
                         }
