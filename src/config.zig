@@ -152,7 +152,7 @@ const Defaults = struct {
     lean_api_path: []const u8 = "/status",
     poll_interval_ms: u64 = 10_000,
     request_timeout_ms: u64 = 5_000,
-    poll_max_concurrency: u32 = 16,
+    poll_max_concurrency: u32 = 64,
     stale_after_ms: u64 = 30_000,
 };
 
@@ -196,7 +196,7 @@ fn printUsage() void {
         \\  --upstreams-config <file> JSON config file with multiple upstreams
         \\  --poll-ms <ms>            Poll interval in milliseconds
         \\  --timeout-ms <ms>         Request timeout per upstream HTTP call
-        \\  --poll-concurrency <n>    Max parallel upstream polls (multi-upstream; default 16)
+        \\  --poll-concurrency <n>    Max parallel upstream polls (multi-upstream; default 64)
         \\  --stale-ms <ms>           Stale threshold in milliseconds
         \\  --static-dir <dir>        Optional static frontend directory
         \\  --help                    Show this help

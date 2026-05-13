@@ -214,7 +214,10 @@ pub const UpstreamManager = struct {
             &state_ssz,
             ctx.timeout_ms,
         )) |slots| {
-            const sub_to = @max(2_000, ctx.timeout_ms / 2);
+            // Optional metadata calls share a small slice of the per-poll budget
+            // (was timeout_ms/2 each; that doubled worker slot occupancy on healthy
+            // peers and starved the dispatcher with many upstreams + bounded cap).
+            const sub_to = @max(@as(u64, 1_000), ctx.timeout_ms / 4);
             ctx.is_aggregator = lean_api.fetchAggregatorOptional(ctx.allocator, &client, ctx.base_url, sub_to);
             ctx.head_slot = lean_api.fetchHeadSlotOptional(ctx.allocator, &client, ctx.base_url, sub_to);
             ctx.slots = slots;
@@ -284,10 +287,15 @@ pub const UpstreamManager = struct {
         const max_w = @min(max_concurrency, 256);
         const cap: usize = @max(1, @min(@as(usize, @intCast(max_w)), n));
 
-        // Per-tick deadline: enough time to drain all batches, plus a small
-        // headroom so a worker that finishes right at the limit still counts.
+        // Per-tick deadline. A single worker can occupy its slot for up to
+        // ~timeout_ms (fetchSlots) + 2 × (timeout_ms / 4) (aux calls) ≈
+        // 1.5 × timeout_ms; in the worst case (slow path on each call) closer
+        // to 2 × timeout_ms. We size the deadline assuming worst case so
+        // dispatch never starves with a bounded cap and slow peers, plus one
+        // extra timeout_ms for the final drain.
         const batches: u64 = (@as(u64, n) + @as(u64, cap) - 1) / @as(u64, cap);
-        const round_ms: u64 = batches * timeout_ms + timeout_ms / 2;
+        const per_worker_max_ms: u64 = timeout_ms * 2;
+        const round_ms: u64 = batches * per_worker_max_ms + timeout_ms;
         const deadline_ms: i64 = now_ms + @as(i64, @intCast(round_ms));
 
         if (cap < n) {
