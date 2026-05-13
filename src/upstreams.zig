@@ -102,82 +102,80 @@ pub const UpstreamManager = struct {
         path: []const u8,
     };
 
-    /// Result of polling a single upstream
-    const PollResult = struct {
-        index: usize,
-        slots: ?lean_api.Slots,
-        error_msg: ?[]const u8,
-        state_ssz: ?[]u8,
-        is_aggregator: ?bool,
-        head_slot: ?u64,
+    // ---------------------------------------------------------------------------
+    // Bounded-concurrency poll dispatcher with deadline-based abandonment.
+    //
+    // Why this shape:
+    //   * std.http.Client.open does a synchronous connect(); SO_RCVTIMEO/SO_SNDTIMEO
+    //     in lean_api only bound the read/write phase, not connect itself. So a
+    //     blackholed peer can hang a worker thread indefinitely.
+    //   * Therefore the dispatcher must NOT join workers (one stuck connect would
+    //     wedge the entire poll loop). It detaches them and waits on a deadline.
+    //   * Refcounted PollCtx lets a slow worker safely outlive the dispatcher
+    //     (it frees its own state when the spawner has already moved on).
+    //   * A condvar-guarded in-flight counter caps OS thread / SSZ-download
+    //     parallelism even when N upstreams >> the configured concurrency.
+    // ---------------------------------------------------------------------------
+
+    /// Slot accounting: caps concurrent in-flight workers and signals the
+    /// dispatcher when one finishes (so the next can be spawned, and the final
+    /// drain wait can wake up early when all workers have completed).
+    const SlotState = struct {
+        mutex: std.Thread.Mutex = .{},
+        cond: std.Thread.Condition = .{},
+        in_flight: usize = 0,
+        cap: usize,
     };
 
-    // ---------------------------------------------------------------------------
-    // Concurrent per-upstream polling context.
-    //
-    // Zig 0.14's std.http.Client does not expose connect_timeout / read_timeout,
-    // so a single hung TCP connection would stall the entire sequential poll loop
-    // forever.  The fix: spawn one thread per upstream and wait for all of them
-    // behind a hard deadline (request_timeout_ms).  If an upstream doesn't answer
-    // in time its thread is detached; it will free its own memory when it
-    // eventually returns (reference-counted via an atomic counter).
-    // ---------------------------------------------------------------------------
-
-    /// Heap-allocated context shared between the spawner and the worker thread.
-    /// Reference-counted (starts at 2: one for the spawner, one for the thread).
-    /// Freed automatically when the last holder calls release().
+    /// Heap context shared between dispatcher and worker (refcount starts at 2).
+    /// Worker writes outputs then `done.store(true, .release)`; dispatcher only
+    /// reads outputs after it has observed done==true (via `.acquire` load).
     const PollCtx = struct {
         allocator: std.mem.Allocator,
-        index: usize,
-        // owned copies of the target strings so the thread stays safe even after
-        // a timeout when the spawner has already moved on.
+        slot: *SlotState,
+        target_index: usize,
+        // Owned copies of target strings — safe past the dispatcher's lifetime.
+        name: []u8,
         base_url: []u8,
         path: []u8,
-        name: []u8,
-        // Socket-level timeout applied to the HTTP request inside the worker.
-        // Bounds the worker's lifetime so detached threads clean up their
-        // sockets within a predictable window (rather than hanging for the
-        // kernel's TCP retransmit window on unresponsive peers).
         timeout_ms: u64,
-        // written by the thread, read by the spawner after deadline
         done: std.atomic.Value(bool),
-        slots: ?lean_api.Slots,
-        error_msg: ?[]u8,
-        state_ssz: ?[]u8,
-        is_aggregator: ?bool,
-        head_slot: ?u64,
-        ref_count: std.atomic.Value(u32),
+        slots: ?lean_api.Slots = null,
+        error_msg: ?[]u8 = null,
+        state_ssz: ?[]u8 = null,
+        is_aggregator: ?bool = null,
+        head_slot: ?u64 = null,
+        refs: std.atomic.Value(u32),
 
         fn create(
             allocator: std.mem.Allocator,
-            index: usize,
-            name: []const u8,
-            base_url: []const u8,
-            path: []const u8,
+            slot: *SlotState,
+            target: PollTarget,
             timeout_ms: u64,
         ) !*PollCtx {
             const ctx = try allocator.create(PollCtx);
+            errdefer allocator.destroy(ctx);
+            const name_copy = try allocator.dupe(u8, target.name);
+            errdefer allocator.free(name_copy);
+            const url_copy = try allocator.dupe(u8, target.base_url);
+            errdefer allocator.free(url_copy);
+            const path_copy = try allocator.dupe(u8, target.path);
             ctx.* = .{
                 .allocator = allocator,
-                .index = index,
-                .name = try allocator.dupe(u8, name),
-                .base_url = try allocator.dupe(u8, base_url),
-                .path = try allocator.dupe(u8, path),
+                .slot = slot,
+                .target_index = target.index,
+                .name = name_copy,
+                .base_url = url_copy,
+                .path = path_copy,
                 .timeout_ms = timeout_ms,
                 .done = std.atomic.Value(bool).init(false),
-                .slots = null,
-                .error_msg = null,
-                .state_ssz = null,
-                .is_aggregator = null,
-                .head_slot = null,
-                .ref_count = std.atomic.Value(u32).init(2),
+                .refs = std.atomic.Value(u32).init(2),
             };
             return ctx;
         }
 
-        /// Drop one reference; destroy when both holders have released.
         fn release(self: *PollCtx) void {
-            if (self.ref_count.fetchSub(1, .acq_rel) == 1) {
+            if (self.refs.fetchSub(1, .acq_rel) == 1) {
                 self.allocator.free(self.name);
                 self.allocator.free(self.base_url);
                 self.allocator.free(self.path);
@@ -188,51 +186,79 @@ pub const UpstreamManager = struct {
         }
     };
 
-    /// Worker thread: creates its own HTTP client, fetches slots, writes result,
-    /// then releases its reference to the context.
-    fn pollUpstreamThread(ctx: *PollCtx) void {
+    /// Decrement the in-flight count and wake any dispatcher waiting on a slot
+    /// or on the final drain. Always called once per worker (defer in worker).
+    fn slotRelease(slot: *SlotState) void {
+        slot.mutex.lock();
+        defer slot.mutex.unlock();
+        if (slot.in_flight > 0) slot.in_flight -= 1;
+        slot.cond.broadcast();
+    }
+
+    /// Worker thread: own HTTP client, write outputs, signal completion. If the
+    /// peer hangs on connect/read this thread may live well past the dispatcher's
+    /// deadline — its PollCtx ref keeps everything alive until cleanup.
+    fn workerThread(ctx: *PollCtx) void {
         defer ctx.release();
+        defer slotRelease(ctx.slot);
 
         var client = std.http.Client{ .allocator = ctx.allocator };
         defer client.deinit();
 
         var state_ssz: ?[]u8 = null;
-        const slots = lean_api.fetchSlots(
+        if (lean_api.fetchSlots(
             ctx.allocator,
             &client,
             ctx.base_url,
             ctx.path,
             &state_ssz,
             ctx.timeout_ms,
-        ) catch |err| {
+        )) |slots| {
+            // Optional metadata calls share a small slice of the per-poll budget
+            // (was timeout_ms/2 each; that doubled worker slot occupancy on healthy
+            // peers and starved the dispatcher with many upstreams + bounded cap).
+            const sub_to = @max(@as(u64, 1_000), ctx.timeout_ms / 4);
+            ctx.is_aggregator = lean_api.fetchAggregatorOptional(ctx.allocator, &client, ctx.base_url, sub_to);
+            ctx.head_slot = lean_api.fetchHeadSlotOptional(ctx.allocator, &client, ctx.base_url, sub_to);
+            ctx.slots = slots;
+            ctx.state_ssz = state_ssz;
+            log.debug("Upstream {s}: justified={d}, finalized={d}", .{
+                ctx.name, slots.justified_slot, slots.finalized_slot,
+            });
+        } else |err| {
+            if (state_ssz) |s| ctx.allocator.free(s);
             ctx.error_msg = std.fmt.allocPrint(ctx.allocator, "{s}", .{@errorName(err)}) catch null;
-            ctx.done.store(true, .release);
-            return;
-        };
+            log.warn("Upstream {s} ({s}) failed: {s}", .{ ctx.name, ctx.base_url, @errorName(err) });
+        }
 
-        // Extra lean HTTP calls share part of the poll budget (avoid 3× full timeout).
-        const sub_to = @max(2_000, ctx.timeout_ms / 2);
-        ctx.is_aggregator = lean_api.fetchAggregatorOptional(ctx.allocator, &client, ctx.base_url, sub_to);
-        ctx.head_slot = lean_api.fetchHeadSlotOptional(ctx.allocator, &client, ctx.base_url, sub_to);
-
-        ctx.slots = slots;
-        ctx.state_ssz = state_ssz;
+        // Publish results to the dispatcher (must come last; release ordering
+        // pairs with the dispatcher's acquire load before reading any field).
         ctx.done.store(true, .release);
     }
 
-    /// Poll all upstreams concurrently and return consensus slots if 50%+ agree.
-    ///
-    /// Each upstream is polled in its own OS thread.  After spawning all threads
-    /// the function waits up to timeout_ms for them all to finish.  Any thread
-    /// still running at the deadline is abandoned (detached); its PollCtx is
-    /// reference-counted so it cleans up itself when it eventually completes.
+    /// Wait until cond is signaled or the deadline elapses. Returns true if
+    /// the deadline has not yet passed (caller can re-check its predicate).
+    fn waitUntilDeadline(slot: *SlotState, deadline_ms: i64) bool {
+        const now = std.time.milliTimestamp();
+        if (now >= deadline_ms) return false;
+        const remaining_ms: u64 = @intCast(deadline_ms - now);
+        // Cap each individual wait so we re-check the predicate periodically
+        // even if a signal is missed for some reason.
+        const wait_ms: u64 = @min(remaining_ms, @as(u64, 100));
+        const wait_ns: u64 = wait_ms * std.time.ns_per_ms;
+        slot.cond.timedWait(&slot.mutex, wait_ns) catch {};
+        return std.time.milliTimestamp() < deadline_ms;
+    }
+
+    /// Poll upstreams with bounded concurrency + a hard per-tick deadline.
+    /// Returns consensus slots if 50%+ of responding upstreams agree.
     pub fn pollUpstreams(
         self: *UpstreamManager,
-        // client parameter kept for API compatibility but is no longer used here;
-        // each thread creates its own client to avoid shared-state data races.
+        // Kept for API compatibility; each worker creates its own client.
         _: *std.http.Client,
         now_ms: i64,
         timeout_ms: u64,
+        max_concurrency: u32,
         out_state_ssz: *?[]u8,
     ) ?lean_api.Slots {
         // Step 1: snapshot upstreams (brief lock)
@@ -257,141 +283,115 @@ pub const UpstreamManager = struct {
 
         if (targets.items.len == 0) return null;
 
-        // Step 2: spawn one thread per upstream
+        const n = targets.items.len;
+        const max_w = @min(max_concurrency, 256);
+        const cap: usize = @max(1, @min(@as(usize, @intCast(max_w)), n));
+
+        // Per-tick deadline. A single worker can occupy its slot for up to
+        // ~timeout_ms (fetchSlots) + 2 × (timeout_ms / 4) (aux calls) ≈
+        // 1.5 × timeout_ms; in the worst case (slow path on each call) closer
+        // to 2 × timeout_ms. We size the deadline assuming worst case so
+        // dispatch never starves with a bounded cap and slow peers, plus one
+        // extra timeout_ms for the final drain.
+        const batches: u64 = (@as(u64, n) + @as(u64, cap) - 1) / @as(u64, cap);
+        const per_worker_max_ms: u64 = timeout_ms * 2;
+        const round_ms: u64 = batches * per_worker_max_ms + timeout_ms;
+        const deadline_ms: i64 = now_ms + @as(i64, @intCast(round_ms));
+
+        if (cap < n) {
+            log.debug(
+                "Polling {d} upstreams with concurrency {d} (≤{d} OS threads, deadline ≤{d}ms)",
+                .{ n, cap, cap, round_ms },
+            );
+        }
+
+        var slot = SlotState{ .cap = cap };
+
         var ctxs = std.ArrayList(*PollCtx).init(self.allocator);
         defer {
-            for (ctxs.items) |ctx| ctx.release(); // spawner releases its ref
+            for (ctxs.items) |ctx| ctx.release();
             ctxs.deinit();
         }
 
+        // Step 2: dispatch — wait for a free slot (or the deadline) before each spawn
         for (targets.items) |target| {
-            const ctx = PollCtx.create(
-                self.allocator,
-                target.index,
-                target.name,
-                target.base_url,
-                target.path,
-                timeout_ms,
-            ) catch |err| {
+            slot.mutex.lock();
+            var slot_acquired = false;
+            while (slot.in_flight >= slot.cap) {
+                if (!waitUntilDeadline(&slot, deadline_ms)) break;
+            }
+            if (slot.in_flight < slot.cap) {
+                slot.in_flight += 1;
+                slot_acquired = true;
+            }
+            slot.mutex.unlock();
+
+            if (!slot_acquired) {
+                log.warn(
+                    "Dispatch deadline reached before {s} could start; remaining upstreams skipped this tick",
+                    .{target.name},
+                );
+                break;
+            }
+
+            const ctx = PollCtx.create(self.allocator, &slot, target, timeout_ms) catch |err| {
                 log.warn("Failed to allocate poll context for {s}: {s}", .{ target.name, @errorName(err) });
+                slotRelease(&slot);
                 continue;
             };
 
-            const thread = std.Thread.spawn(.{}, pollUpstreamThread, .{ctx}) catch |err| {
+            const t = std.Thread.spawn(.{}, workerThread, .{ctx}) catch |err| {
                 log.warn("Failed to spawn poll thread for {s}: {s}", .{ target.name, @errorName(err) });
-                ctx.release(); // thread never ran — release thread's ref too
-                ctx.release(); // release spawner's ref
+                slotRelease(&slot);
+                ctx.release(); // worker ref (worker never started)
+                ctx.release(); // dispatcher ref
                 continue;
             };
-            thread.detach();
+            t.detach();
 
             ctxs.append(ctx) catch {
-                // append failed; ctx's thread is already running and holds its own ref,
-                // so just release the spawner's ref.
+                // Worker is already running and holds its own ref — just drop ours.
                 ctx.release();
                 continue;
             };
         }
 
-        if (ctxs.items.len == 0) return null;
-
-        // Step 3: wait for all threads behind a hard deadline
-        const deadline_ms = now_ms + @as(i64, @intCast(timeout_ms));
-        while (std.time.milliTimestamp() < deadline_ms) {
-            var all_done = true;
-            for (ctxs.items) |ctx| {
-                if (!ctx.done.load(.acquire)) {
-                    all_done = false;
-                    break;
-                }
-            }
-            if (all_done) break;
-            std.time.sleep(5 * std.time.ns_per_ms);
+        // Step 3: drain — wait for all in-flight workers to finish, or the deadline
+        slot.mutex.lock();
+        while (slot.in_flight > 0) {
+            if (!waitUntilDeadline(&slot, deadline_ms)) break;
         }
+        slot.mutex.unlock();
 
-        // Log any upstreams that timed out
-        for (ctxs.items) |ctx| {
-            if (!ctx.done.load(.acquire)) {
-                log.warn("Upstream {s} ({s}) timed out after {d}ms — detaching thread", .{
-                    ctx.name, ctx.base_url, timeout_ms,
-                });
-            }
-        }
-
-        // Step 4: collect results from completed threads and update upstream state
-        var results = std.ArrayList(PollResult).init(self.allocator);
-        defer {
-            for (results.items) |result| {
-                if (result.error_msg) |msg| self.allocator.free(msg);
-                if (result.state_ssz) |blob| self.allocator.free(blob);
-            }
-            results.deinit();
-        }
-
-        for (ctxs.items) |ctx| {
-            if (!ctx.done.load(.acquire)) {
-                // Timed out — record as an error so the upstream shows as failing
-                const error_msg = self.allocator.dupe(u8, "timeout") catch null;
-                results.append(PollResult{
-                    .index = ctx.index,
-                    .slots = null,
-                    .error_msg = error_msg,
-                    .state_ssz = null,
-                    .is_aggregator = null,
-                    .head_slot = null,
-                }) catch continue;
-                continue;
-            }
-
-            if (ctx.slots) |slots| {
-                log.debug("Upstream {s}: justified={d}, finalized={d}", .{
-                    ctx.name, slots.justified_slot, slots.finalized_slot,
-                });
-                // Transfer ownership of SSZ blob out of the ctx before ctx.release()
-                // is called by the defer above.  We null it in ctx to avoid double-free.
-                const ssz = ctx.state_ssz;
-                ctx.state_ssz = null;
-                results.append(PollResult{
-                    .index = ctx.index,
-                    .slots = slots,
-                    .error_msg = null,
-                    .state_ssz = ssz,
-                    .is_aggregator = ctx.is_aggregator,
-                    .head_slot = ctx.head_slot,
-                }) catch continue;
-            } else {
-                const err_copy = if (ctx.error_msg) |m| self.allocator.dupe(u8, m) catch null else null;
-                log.warn("Upstream {s} ({s}) failed: {s}", .{
-                    ctx.name,
-                    ctx.base_url,
-                    ctx.error_msg orelse "unknown",
-                });
-                results.append(PollResult{
-                    .index = ctx.index,
-                    .slots = null,
-                    .error_msg = err_copy,
-                    .state_ssz = null,
-                    .is_aggregator = null,
-                    .head_slot = null,
-                }) catch continue;
-            }
-        }
-
-        // Step 5: Update upstream states (brief lock)
+        // Step 4: collect results and update per-upstream state under our lock.
         var slot_counts = std.AutoHashMap(u128, u32).init(self.allocator);
         defer slot_counts.deinit();
 
         var successful_polls: u32 = 0;
+        var timed_out: u32 = 0;
 
         {
             self.mutex.lock();
             defer self.mutex.unlock();
 
-            for (results.items, 0..) |*result, i| {
-                if (result.index >= self.upstreams.items.len) continue;
-                var upstream = &self.upstreams.items[result.index];
+            for (ctxs.items) |ctx| {
+                if (ctx.target_index >= self.upstreams.items.len) continue;
+                var upstream = &self.upstreams.items[ctx.target_index];
 
-                if (result.slots) |slots| {
+                // Acquire ordering: pairs with the worker's release store on `done`.
+                const finished = ctx.done.load(.acquire);
+
+                if (!finished) {
+                    timed_out += 1;
+                    upstream.error_count += 1;
+                    if (upstream.last_error) |old_err| self.allocator.free(old_err);
+                    upstream.last_error = self.allocator.dupe(u8, "timeout (worker abandoned)") catch null;
+                    upstream.is_aggregator = null;
+                    upstream.head_slot = null;
+                    continue;
+                }
+
+                if (ctx.slots) |slots| {
                     if (upstream.last_error) |old_err| {
                         self.allocator.free(old_err);
                         upstream.last_error = null;
@@ -399,8 +399,8 @@ pub const UpstreamManager = struct {
                     upstream.error_count = 0;
                     upstream.last_slots = slots;
                     upstream.last_success_ms = now_ms;
-                    upstream.is_aggregator = result.is_aggregator;
-                    upstream.head_slot = result.head_slot;
+                    upstream.is_aggregator = ctx.is_aggregator;
+                    upstream.head_slot = ctx.head_slot;
 
                     const slot_key: u128 = (@as(u128, slots.justified_slot) << 64) | @as(u128, slots.finalized_slot);
                     const count = slot_counts.get(slot_key) orelse 0;
@@ -410,15 +410,22 @@ pub const UpstreamManager = struct {
                 } else {
                     upstream.error_count += 1;
                     if (upstream.last_error) |old_err| self.allocator.free(old_err);
-                    upstream.last_error = result.error_msg;
+                    if (ctx.error_msg) |msg| {
+                        upstream.last_error = self.allocator.dupe(u8, msg) catch null;
+                    } else {
+                        upstream.last_error = self.allocator.dupe(u8, "unknown error") catch null;
+                    }
                     upstream.is_aggregator = null;
                     upstream.head_slot = null;
-                    results.items[i].error_msg = null; // ownership transferred
                 }
             }
         }
 
-        // Step 6: consensus (no lock needed)
+        if (timed_out > 0) {
+            log.warn("{d}/{d} upstream polls did not finish within deadline (continuing)", .{ timed_out, ctxs.items.len });
+        }
+
+        // Step 5: consensus (no lock needed)
         if (successful_polls == 0) {
             log.warn("No upstreams responded successfully", .{});
             return null;
@@ -433,12 +440,16 @@ pub const UpstreamManager = struct {
                 const justified_slot: u64 = @truncate(slot_key >> 64);
                 const finalized_slot: u64 = @truncate(slot_key & 0xFFFFFFFFFFFFFFFF);
 
-                for (results.items, 0..) |*res, i| {
-                    if (res.slots) |s| {
+                // Hand out one matching SSZ blob. Move ownership out of the
+                // ctx so PollCtx.release() doesn't free it; remaining ctxs'
+                // ssz blobs are freed normally on release.
+                for (ctxs.items) |ctx| {
+                    if (!ctx.done.load(.acquire)) continue;
+                    if (ctx.slots) |s| {
                         if (s.justified_slot == justified_slot and s.finalized_slot == finalized_slot) {
-                            if (res.state_ssz) |blob| {
+                            if (ctx.state_ssz) |blob| {
                                 out_state_ssz.* = blob;
-                                results.items[i].state_ssz = null;
+                                ctx.state_ssz = null;
                                 break;
                             }
                         }
