@@ -248,13 +248,19 @@ pub const UpstreamManager = struct {
         for (0..cap) |_| {
             threads[spawned] = std.Thread.spawn(.{}, pollUpstreamWorker, .{&work}) catch |err| {
                 log.warn("Failed to spawn poll worker ({d}/{d}): {s}", .{ spawned, cap, @errorName(err) });
-                for (0..spawned) |j| threads[j].join();
-                return null;
+                // Do not return here: workers already running drain the full work queue; after
+                // join their `results` are valid. Proceeding to Step 2 applies per-upstream status.
+                break;
             };
             spawned += 1;
         }
 
         for (0..spawned) |j| threads[j].join();
+
+        if (spawned == 0) {
+            log.warn("No poll workers could be started (spawn failed for every slot)", .{});
+            return null;
+        }
 
         // Step 2: Update upstream states (brief lock)
         var slot_counts = std.AutoHashMap(u128, u32).init(self.allocator);
